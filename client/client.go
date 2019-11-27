@@ -21,6 +21,7 @@
 package client
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -36,23 +37,8 @@ import (
 	"github.com/topfreegames/pitaya/conn/message"
 	"github.com/topfreegames/pitaya/conn/packet"
 	"github.com/topfreegames/pitaya/logger"
+	"github.com/topfreegames/pitaya/session"
 	"github.com/topfreegames/pitaya/util/compression"
-)
-
-var (
-	handshakeBuffer = `
-{
-	"sys": {
-		"platform": "mac",
-		"libVersion": "0.3.5-release",
-		"clientBuildNumber":"20",
-		"clientVersion":"2.1"
-	},
-	"user": {
-		"age": 30
-	}
-}
-`
 )
 
 // HandshakeSys struct
@@ -75,19 +61,20 @@ type pendingRequest struct {
 
 // Client struct
 type Client struct {
-	conn            net.Conn
-	Connected       bool
-	packetEncoder   codec.PacketEncoder
-	packetDecoder   codec.PacketDecoder
-	packetChan      chan *packet.Packet
-	IncomingMsgChan chan *message.Message
-	pendingChan     chan bool
-	pendingRequests map[uint]*pendingRequest
-	pendingReqMutex sync.Mutex
-	requestTimeout  time.Duration
-	closeChan       chan struct{}
-	nextID          uint32
-	messageEncoder  message.Encoder
+	conn                net.Conn
+	Connected           bool
+	packetEncoder       codec.PacketEncoder
+	packetDecoder       codec.PacketDecoder
+	packetChan          chan *packet.Packet
+	IncomingMsgChan     chan *message.Message
+	pendingChan         chan bool
+	pendingRequests     map[uint]*pendingRequest
+	pendingReqMutex     sync.Mutex
+	requestTimeout      time.Duration
+	closeChan           chan struct{}
+	nextID              uint32
+	messageEncoder      message.Encoder
+	clientHandshakeData *session.HandshakeData
 }
 
 // MsgChannel return the incoming message channel
@@ -124,11 +111,31 @@ func New(logLevel logrus.Level, requestTimeout ...time.Duration) *Client {
 		// TODO this should probably be configurable
 		pendingChan:    make(chan bool, 30),
 		messageEncoder: message.NewMessagesEncoder(true),
+		clientHandshakeData: &session.HandshakeData{
+			Sys: session.HandshakeClientData{
+				Platform:    "mac",
+				LibVersion:  "0.3.5-release",
+				BuildNumber: "20",
+				Version:     "2.1",
+			},
+			User: map[string]interface{}{
+				"age": 30,
+			},
+		},
 	}
 }
 
+func (c *Client) SetClientHandshakeData(data *session.HandshakeData) {
+	c.clientHandshakeData = data
+}
+
 func (c *Client) sendHandshakeRequest() error {
-	p, err := c.packetEncoder.Encode(packet.Handshake, []byte(handshakeBuffer))
+	enc, err := json.Marshal(c.clientHandshakeData)
+	if err != nil {
+		return err
+	}
+
+	p, err := c.packetEncoder.Encode(packet.Handshake, enc)
 	if err != nil {
 		return err
 	}
@@ -137,7 +144,7 @@ func (c *Client) sendHandshakeRequest() error {
 }
 
 func (c *Client) handleHandshakeResponse() error {
-	buf := make([]byte, 2048)
+	buf := bytes.NewBuffer(nil)
 	packets, err := c.readPackets(buf)
 	if err != nil {
 		return err
@@ -255,29 +262,34 @@ func (c *Client) handlePackets() {
 	}
 }
 
-func (c *Client) readPackets(buf []byte) ([]*packet.Packet, error) {
+func (c *Client) readPackets(buf *bytes.Buffer) ([]*packet.Packet, error) {
 	// listen for sv messages
-	n := len(buf)
+	data := make([]byte, 1024)
+	n := len(data)
 	var err error
 
-	data := make([]byte, 0)
-	for n == len(buf) {
-		n, err = c.conn.Read(buf)
+	for n == len(data) {
+		n, err = c.conn.Read(data)
 		if err != nil {
 			return nil, err
 		}
-		data = append(data, buf[:n]...)
+		buf.Write(data[:n])
 	}
-	packets, err := c.packetDecoder.Decode(data)
+	packets, err := c.packetDecoder.Decode(buf.Bytes())
 	if err != nil {
 		logger.Log.Errorf("error decoding packet from server: %s", err.Error())
 	}
+	totalProcessed := 0
+	for _, p := range packets {
+		totalProcessed += codec.HeadLength + p.Length
+	}
+	buf.Next(totalProcessed)
 
 	return packets, nil
 }
 
 func (c *Client) handleServerMessages() {
-	buf := make([]byte, 1024)
+	buf := bytes.NewBuffer(nil)
 	defer c.Disconnect()
 	for c.Connected {
 		packets, err := c.readPackets(buf)

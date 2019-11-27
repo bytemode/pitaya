@@ -23,13 +23,11 @@ package util
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"runtime/debug"
 
-	"github.com/google/uuid"
-	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/sirupsen/logrus"
 	"github.com/topfreegames/pitaya/conn/message"
 	"github.com/topfreegames/pitaya/constants"
 	pcontext "github.com/topfreegames/pitaya/context"
@@ -37,19 +35,43 @@ import (
 	"github.com/topfreegames/pitaya/logger"
 	"github.com/topfreegames/pitaya/protos"
 	"github.com/topfreegames/pitaya/serialize"
+	"github.com/topfreegames/pitaya/serialize/json"
+	"github.com/topfreegames/pitaya/serialize/protobuf"
 	"github.com/topfreegames/pitaya/tracing"
+
+	"github.com/google/uuid"
+	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/sirupsen/logrus"
 )
+
+func getLoggerFromArgs(args []reflect.Value) logger.Logger {
+	for _, a := range args {
+		if !a.IsValid() {
+			continue
+		}
+		if ctx, ok := a.Interface().(context.Context); ok {
+			logVal := ctx.Value(constants.LoggerCtxKey)
+			if logVal != nil {
+				log := logVal.(logger.Logger)
+				return log
+			}
+		}
+	}
+	return logger.Log
+}
 
 // Pcall calls a method that returns an interface and an error and recovers in case of panic
 func Pcall(method reflect.Method, args []reflect.Value) (rets interface{}, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			logger.Log.Errorf("pitaya/dispatch: %v", rec)
-			logger.Log.Debugf("%s", debug.Stack())
+			// Try to use logger from context here to help trace error cause
+			log := getLoggerFromArgs(args)
+			log.Errorf("panic - pitaya/dispatch: %s: %v", method.Name, rec)
+			log.Debugf("%s", debug.Stack())
 			if s, ok := rec.(string); ok {
 				err = errors.New(s)
 			} else {
-				err = errors.New("rpc call internal error")
+				err = fmt.Errorf("rpc call internal error - %s: %v", method.Name, rec)
 			}
 		}
 	}()
@@ -97,6 +119,20 @@ func FileExists(filename string) bool {
 	return err == nil || os.IsExist(err)
 }
 
+// GetErrorFromPayload gets the error from payload
+func GetErrorFromPayload(serializer serialize.Serializer, payload []byte) error {
+	err := &e.Error{Code: e.ErrUnknownCode}
+	switch serializer.(type) {
+	case *json.Serializer:
+		_ = serializer.Unmarshal(payload, err)
+	case *protobuf.Serializer:
+		pErr := &protos.Error{Code: e.ErrUnknownCode}
+		_ = serializer.Unmarshal(payload, pErr)
+		err = &e.Error{Code: pErr.Code, Message: pErr.Msg, Metadata: pErr.Metadata}
+	}
+	return err
+}
+
 // GetErrorPayload creates and serializes an error payload
 func GetErrorPayload(serializer serialize.Serializer, err error) ([]byte, error) {
 	code := e.ErrUnknownCode
@@ -129,23 +165,54 @@ func ConvertProtoToMessageType(protoMsgType protos.MsgType) message.Type {
 }
 
 // CtxWithDefaultLogger inserts a default logger on ctx to be used on handlers and remotes.
-// If using logrus, sessionsId, route and requestId will be added as fields.
+// If using logrus, userId, route and requestId will be added as fields.
 // Otherwise the pitaya logger will be used as it is.
-func CtxWithDefaultLogger(ctx context.Context, route, sessionID string) context.Context {
+func CtxWithDefaultLogger(ctx context.Context, route, userID string) context.Context {
 	var defaultLogger logger.Logger
 	logrusLogger, ok := logger.Log.(logrus.FieldLogger)
 	if ok {
+		requestID := pcontext.GetFromPropagateCtx(ctx, constants.RequestIDKey)
+		if rID, ok := requestID.(string); ok {
+			if rID == "" {
+				requestID = uuid.New()
+			}
+		} else {
+			requestID = uuid.New()
+		}
 		defaultLogger = logrusLogger.WithFields(
 			logrus.Fields{
-				"sessionId": sessionID,
 				"route":     route,
-				"requestId": uuid.New(),
+				"requestId": requestID,
+				"userId":    userID,
 			})
 	} else {
 		defaultLogger = logger.Log
 	}
 
 	return context.WithValue(ctx, constants.LoggerCtxKey, defaultLogger)
+}
+
+// StartSpanFromRequest starts a tracing span from the request
+func StartSpanFromRequest(
+	ctx context.Context,
+	serverID, route string,
+) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	tags := opentracing.Tags{
+		"local.id":     serverID,
+		"span.kind":    "server",
+		"peer.id":      pcontext.GetFromPropagateCtx(ctx, constants.PeerIDKey),
+		"peer.service": pcontext.GetFromPropagateCtx(ctx, constants.PeerServiceKey),
+		"request.id":   pcontext.GetFromPropagateCtx(ctx, constants.RequestIDKey),
+	}
+	parent, err := tracing.ExtractSpan(ctx)
+	if err != nil {
+		logger.Log.Warnf("failed to retrieve parent span: %s", err.Error())
+	}
+	ctx = tracing.StartSpan(ctx, route, tags, parent)
+	return ctx
 }
 
 // GetContextFromRequest gets the context from a request
@@ -157,17 +224,6 @@ func GetContextFromRequest(req *protos.Request, serverID string) (context.Contex
 	if ctx == nil {
 		return nil, constants.ErrNoContextFound
 	}
-	tags := opentracing.Tags{
-		"local.id":     serverID,
-		"span.kind":    "server",
-		"peer.id":      pcontext.GetFromPropagateCtx(ctx, constants.PeerIDKey),
-		"peer.service": pcontext.GetFromPropagateCtx(ctx, constants.PeerServiceKey),
-	}
-	parent, err := tracing.ExtractSpan(ctx)
-	if err != nil {
-		logger.Log.Warnf("failed to retrieve parent span: %s", err.Error())
-	}
-	ctx = tracing.StartSpan(ctx, req.GetMsg().GetRoute(), tags, parent)
 	ctx = CtxWithDefaultLogger(ctx, req.GetMsg().GetRoute(), "")
 	return ctx, nil
 }

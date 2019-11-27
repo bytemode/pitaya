@@ -27,6 +27,14 @@ These configuration values configure service discovery for the default etcd serv
     - localhost:2379
     - string
     - List of comma separated etcd endpoints
+  * - pitaya.cluster.sd.etcd.user
+    - 
+    - string
+    - Username to connect to etcd
+  * - pitaya.cluster.sd.etcd.pass
+    - 
+    - string
+    - Password to connect to etcd
   * - pitaya.cluster.sd.etcd.heartbeat.ttl
     - 60s
     - time.Time
@@ -57,8 +65,20 @@ These configuration values configure service discovery for the default etcd serv
     - Prefix used to avoid collisions with different pitaya applications, servers must have the same prefix to be able to see each other
   * - pitaya.cluster.sd.etcd.syncservers.interval
     - 120s
-    - time.Time
+    - time.Duration
     - Interval between server syncs performed by the service discovery module
+  * - pitaya.cluster.sd.etcd.shutdown.delay
+    - 10ms
+    - time.Duration
+    - Time to wait to shutdown after deregistering from service discovery
+  * - pitaya.cluster.sd.etcd.servertypeblacklist
+    - nil
+    - []string
+    - A list of server types that should be ignored by the service discovery
+  * - pitaya.cluster.sd.etcd.syncserversparallelism
+    - 10
+    - int
+    - The number of goroutines that should be used while getting server information on etcd initialization
 
 RPC Service
 ===========
@@ -82,18 +102,26 @@ The configurations only need to be set if the RPC Service is enabled with the gi
     - 100
     - int
     - Size of the buffer that the nats RPC server creates for push messages
+  * - pitaya.cluster.rpc.client.grpc.dialtimeout
+    - 5s
+    - time.Time
+    - Timeout for the gRPC client to establish the connection
+  * - pitaya.cluster.rpc.client.grpc.lazyconnection
+    - false
+    - bool
+    - Whether the gRPC client should use a lazy connection, that is, connect only when a request is made to that server
   * - pitaya.cluster.rpc.client.grpc.requesttimeout
     - 5s
     - time.Time
     - Request timeout for RPC calls with the gRPC client
-  * - pitaya.cluster.rpc.client.grpc.dialtimeout
-    - 5s
-    - time.Tim
-    - Timeout for the gRPC client to establish the connection
   * - pitaya.cluster.rpc.client.nats.connect
     - nats://localhost:4222
     - string
     - Nats address for the client
+  * - pitaya.cluster.rpc.client.nats.connectiontimeout
+    - 5s
+    - time.Duration
+    - Timeout for the nats client to establish the connection
   * - pitaya.cluster.rpc.client.nats.requesttimeout
     - 5s
     - time.Time
@@ -106,6 +134,10 @@ The configurations only need to be set if the RPC Service is enabled with the gi
     - nats://localhost:4222
     - string
     - Nats address for the server
+  * - pitaya.cluster.rpc.server.nats.connectiontimeout
+    - 5s
+    - time.Duration
+    - Timeout for the nats server to establish the connection
   * - pitaya.cluster.rpc.server.nats.maxreconnectionretries
     - 15
     - int
@@ -126,10 +158,18 @@ The configurations only need to be set if the RPC Service is enabled with the gi
     - 10
     - string
     - Number of connections to keep with Redis
+  * - pitaya.worker.redis.password
+    - ""
+    - string
+    - Redis password to connect to pitaya workers redis
   * - pitaya.worker.concurrency
     - 1
     - int
     - Number of workers to execute job
+  * - pitaya.worker.namespace
+    - ""
+    - string
+    - Worker namespace, can be used to differ stacks in a blue-green deployment
   * - pitaya.worker.retry.enabled
     - true
     - bool
@@ -175,6 +215,18 @@ Connection
     - 30s
     - time.Time
     - Keepalive heartbeat interval for the client connection
+  * - pitaya.conn.ratelimiting.interval
+    - 1s
+    - time.Duration
+    - Window of time to count requests
+  * - pitaya.conn.ratelimiting.limit
+    - 20
+    - int
+    - Max number of requests allowed in a interval
+  * - pitaya.conn.ratelimiting.forcedisable
+    - false
+    - bool
+    - If true, ignores rate limiting even when added with WithWrappers
 
 Metrics Reporting
 =================

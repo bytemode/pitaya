@@ -58,6 +58,43 @@ var etcdSDTablesMultipleServers = []struct {
 	}},
 }
 
+var etcdSDBlacklistTables = []struct {
+	name                string
+	server              *Server
+	serversToAdd        []*Server
+	serverTypeBlacklist []string
+}{
+	{
+		name:   "test1",
+		server: NewServer("frontend-1", "type1", true, nil),
+		serversToAdd: []*Server{
+			NewServer("frontend-1", "type1", true, nil),
+		},
+		serverTypeBlacklist: nil,
+	},
+	{
+		name:   "test2",
+		server: NewServer("frontend-1", "type1", true, nil),
+		serversToAdd: []*Server{
+			NewServer("backend-1", "type1", false, nil),
+			NewServer("backend-2", "type2", false, nil),
+			NewServer("backend-3", "type3", false, nil),
+		},
+		serverTypeBlacklist: []string{"type2"},
+	},
+	{
+		name:   "test3",
+		server: NewServer("frontend-1", "type1", true, nil),
+		serversToAdd: []*Server{
+			NewServer("backend-1", "type1", false, nil),
+			NewServer("backend-2", "type2", false, nil),
+			NewServer("backend-3", "type3", false, nil),
+			NewServer("backend-4", "type4", false, nil),
+		},
+		serverTypeBlacklist: []string{"type1", "type4"},
+	},
+}
+
 func getConfig(conf ...*viper.Viper) *config.Config {
 	config := config.NewConfig(conf...)
 	return config
@@ -260,6 +297,24 @@ func TestEtcdSDInit(t *testing.T) {
 	}
 }
 
+func TestEtcdBeforeShutdown(t *testing.T) {
+	t.Parallel()
+	for _, table := range etcdSDTables {
+		t.Run(table.server.ID, func(t *testing.T) {
+			config := getConfig()
+			c, cli := helpers.GetTestEtcd(t)
+			defer c.Terminate(t)
+			e := getEtcdSD(t, config, table.server, cli)
+			e.Init()
+			assert.True(t, e.running)
+			e.BeforeShutdown()
+			assert.True(t, e.running)
+			_, err := cli.Revoke(context.TODO(), e.leaseID)
+			assert.Error(t, err)
+		})
+	}
+}
+
 func TestEtcdShutdown(t *testing.T) {
 	t.Parallel()
 	for _, table := range etcdSDTables {
@@ -272,8 +327,6 @@ func TestEtcdShutdown(t *testing.T) {
 			assert.True(t, e.running)
 			e.Shutdown()
 			assert.False(t, e.running)
-			_, err := cli.Revoke(context.TODO(), e.leaseID)
-			assert.Error(t, err)
 		})
 	}
 }
@@ -301,7 +354,7 @@ func TestEtcdWatchChangesAddNewServers(t *testing.T) {
 			}
 			err = e.addServerIntoEtcd(newServer)
 			assert.NoError(t, err)
-			ss, err := e.getServerFromEtcd(newServer.Type, newServer.ID)
+			ss, err := getServerFromEtcd(e.cli, newServer.Type, newServer.ID)
 			assert.NoError(t, err)
 			assert.Equal(t, newServer, ss)
 			helpers.ShouldEventuallyReturn(t, func() int {
@@ -335,7 +388,7 @@ func TestEtcdWatchChangesDeleteServers(t *testing.T) {
 			}
 			err = e.addServerIntoEtcd(newServer)
 			assert.NoError(t, err)
-			ss, err := e.getServerFromEtcd(newServer.Type, newServer.ID)
+			ss, err := getServerFromEtcd(e.cli, newServer.Type, newServer.ID)
 			assert.NoError(t, err)
 			assert.Equal(t, newServer, ss)
 			helpers.ShouldEventuallyReturn(t, func() int {
@@ -349,5 +402,116 @@ func TestEtcdWatchChangesDeleteServers(t *testing.T) {
 				return len(serversNow)
 			}, 1)
 		})
+	}
+}
+
+func TestEtcdWatchChangesWithBlacklist(t *testing.T) {
+	t.Parallel()
+	for _, table := range etcdSDBlacklistTables {
+		t.Run(table.name, func(t *testing.T) {
+			conf := viper.New()
+			conf.Set("pitaya.cluster.sd.etcd.syncservers.interval", "10ms")
+			conf.Set("pitaya.cluster.sd.etcd.serverTypeBlacklist", table.serverTypeBlacklist)
+			config := getConfig(conf)
+			c, cli := helpers.GetTestEtcd(t)
+			defer c.Terminate(t)
+			e := getEtcdSD(t, config, table.server, cli)
+			e.running = true
+			_ = e.bootstrapServer(table.server)
+			e.watchEtcdChanges()
+
+			serversBefore, err := e.GetServersByType(table.server.Type)
+			assert.NoError(t, err)
+			assert.Equal(t, 1, len(serversBefore))
+
+			// Add all servers to ETCD
+			for _, serverToAdd := range table.serversToAdd {
+				_, err := cli.Put(
+					context.TODO(),
+					getKey(serverToAdd.ID, serverToAdd.Type),
+					serverToAdd.AsJSONString(),
+				)
+				assert.NoError(t, err)
+			}
+
+			numRequiredServersInSd := func() int {
+				num := 0
+				for _, serverToAdd := range table.serversToAdd {
+					if !e.isServerTypeBlacklisted(serverToAdd.Type) {
+						num++
+					}
+				}
+				return num + 1 // The server itself is always added to the cache, that's why we add one here
+			}
+
+			numServersInSd := func() int {
+				num := 0
+
+				_, err := e.GetServer(table.server.ID)
+				if err == nil {
+					num++
+				}
+				for _, serverToAdd := range table.serversToAdd {
+					_, err := e.GetServer(serverToAdd.ID)
+					if err == nil {
+						num++
+					}
+				}
+				return num
+			}
+
+			helpers.ShouldEventuallyReturn(t, numServersInSd, numRequiredServersInSd())
+		})
+	}
+}
+
+func TestParallelGetter(t *testing.T) {
+	c, cli := helpers.GetTestEtcd(t)
+	defer c.Terminate(t)
+
+	serversToAdd := []*Server{
+		NewServer("frontend-1", "type1", true, nil),
+		NewServer("frontend-2", "type2", true, nil),
+		NewServer("frontend-3", "type3", true, nil),
+		NewServer("frontend-4", "type4", true, nil),
+		NewServer("frontend-5", "type5", true, nil),
+		NewServer("frontend-6", "type6", true, nil),
+		NewServer("frontend-7", "type7", true, nil),
+		NewServer("frontend-8", "type8", true, nil),
+		NewServer("frontend-9", "type9", true, nil),
+	}
+
+	// Add server
+	for _, serverToAdd := range serversToAdd {
+		_, err := cli.Put(
+			context.TODO(),
+			getKey(serverToAdd.ID, serverToAdd.Type),
+			serverToAdd.AsJSONString(),
+		)
+		assert.NoError(t, err)
+	}
+
+	parallelGetter := newParallelGetter(cli, 5)
+	for _, serverToAdd := range serversToAdd {
+		parallelGetter.addWork(serverToAdd.Type, serverToAdd.ID)
+	}
+
+	servers := parallelGetter.waitAndGetResult()
+	assert.Equal(t, len(serversToAdd), len(servers))
+
+	// We add the returned servers to a map first, since the results may be out the order they were added.
+	serversMap := map[string]*Server{}
+	for _, sv := range servers {
+		_, ok := serversMap[sv.ID]
+		assert.False(t, ok)
+		serversMap[sv.ID] = sv
+	}
+
+	for _, serverToAdd := range serversToAdd {
+		sv, ok := serversMap[serverToAdd.ID]
+		assert.True(t, ok)
+		assert.Equal(t, serverToAdd.Type, sv.Type)
+		assert.Equal(t, serverToAdd.ID, sv.ID)
+		assert.Equal(t, serverToAdd.Frontend, sv.Frontend)
 	}
 }

@@ -27,10 +27,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/golang/mock/gomock"
+	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
-	nats "github.com/nats-io/go-nats"
+	nats "github.com/nats-io/nats.go"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/topfreegames/pitaya/conn/message"
@@ -428,7 +428,7 @@ func TestNatsRPCClientCall(t *testing.T) {
 		{"test_error", &protos.Response{Data: []byte("nok"), Error: &protos.Error{Msg: "nok"}}, nil, e.NewError(errors.New("nok"), e.ErrUnknownCode)},
 		{"test_ok", &protos.Response{Data: []byte("ok")}, &protos.Response{Data: []byte("ok")}, nil},
 		{"test_bad_response", []byte("invalid"), nil, errors.New("unexpected EOF")},
-		{"test_bad_proto", &protos.Session{Id: 1, Uid: "snap"}, nil, errors.New("proto: wrong wireType = 0 for field Data")},
+		{"test_bad_proto", &protos.Session{Id: 1, Uid: "snap"}, nil, errors.New("unexpected EOF")},
 		{"test_no_response", nil, nil, errors.New("nats: timeout")},
 	}
 

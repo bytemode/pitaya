@@ -370,17 +370,17 @@ func Start() {
 			app.serviceDiscovery.AddListener(app.rpcClient.(*cluster.GRPCClient))
 		}
 
-		err := RegisterModuleBefore(app.serviceDiscovery, "serviceDiscovery")
-		if err != nil {
-			logger.Log.Fatal("failed to register service discovery module: %s", err.Error())
-		}
-		err = RegisterModuleBefore(app.rpcServer, "rpcServer")
-		if err != nil {
+		if err := RegisterModuleBefore(app.rpcServer, "rpcServer"); err != nil {
 			logger.Log.Fatal("failed to register rpc server module: %s", err.Error())
 		}
-		err = RegisterModuleBefore(app.rpcClient, "rpcClient")
-		if err != nil {
+		if err := RegisterModuleBefore(app.rpcClient, "rpcClient"); err != nil {
 			logger.Log.Fatal("failed to register rpc client module: %s", err.Error())
+		}
+		// set the service discovery as the last module to be started to ensure
+		// all modules have been properly initialized before the server starts
+		// receiving requests from other pitaya servers
+		if err := RegisterModuleAfter(app.serviceDiscovery, "serviceDiscovery"); err != nil {
+			logger.Log.Fatal("failed to register service discovery module: %s", err.Error())
 		}
 
 		app.router.SetServiceDiscovery(app.serviceDiscovery)
@@ -439,6 +439,7 @@ func Start() {
 
 	logger.Log.Warn("server is stopping...")
 
+	session.CloseAll()
 	shutdownModules()
 	shutdownComponents()
 }
@@ -521,12 +522,22 @@ func Error(err error, code string, metadata ...map[string]string) *errors.Error 
 
 // GetSessionFromCtx retrieves a session from a given context
 func GetSessionFromCtx(ctx context.Context) *session.Session {
-	return ctx.Value(constants.SessionCtxKey).(*session.Session)
+	sessionVal := ctx.Value(constants.SessionCtxKey)
+	if sessionVal == nil {
+		logger.Log.Debug("ctx doesn't contain a session, are you calling GetSessionFromCtx from inside a remote?")
+		return nil
+	}
+	return sessionVal.(*session.Session)
 }
 
 // GetDefaultLoggerFromCtx returns the default logger from the given context
 func GetDefaultLoggerFromCtx(ctx context.Context) logger.Logger {
-	return ctx.Value(constants.LoggerCtxKey).(logger.Logger)
+	l := ctx.Value(constants.LoggerCtxKey)
+	if l == nil {
+		return logger.Log
+	}
+
+	return l.(logger.Logger)
 }
 
 // AddMetricTagsToPropagateCtx adds a key and metric tags that will
@@ -575,11 +586,14 @@ func Documentation(getPtrNames bool) (map[string]interface{}, error) {
 // port into metadata
 func AddGRPCInfoToMetadata(
 	metadata map[string]string,
-	region, host, externalHost, port string,
+	region string,
+	host, port string,
+	externalHost, externalPort string,
 ) map[string]string {
 	metadata[constants.GRPCHostKey] = host
-	metadata[constants.GRPCExternalHostKey] = externalHost
 	metadata[constants.GRPCPortKey] = port
+	metadata[constants.GRPCExternalHostKey] = externalHost
+	metadata[constants.GRPCExternalPortKey] = externalPort
 	metadata[constants.RegionKey] = region
 	return metadata
 }

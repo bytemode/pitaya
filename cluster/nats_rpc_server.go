@@ -25,9 +25,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"time"
 
-	"github.com/gogo/protobuf/proto"
-	nats "github.com/nats-io/go-nats"
+	"github.com/golang/protobuf/proto"
+	nats "github.com/nats-io/nats.go"
 	"github.com/topfreegames/pitaya/config"
 	"github.com/topfreegames/pitaya/constants"
 	e "github.com/topfreegames/pitaya/errors"
@@ -41,6 +42,7 @@ import (
 // NatsRPCServer struct
 type NatsRPCServer struct {
 	connString             string
+	connectionTimeout      time.Duration
 	maxReconnectionRetries int
 	server                 *Server
 	conn                   *nats.Conn
@@ -68,13 +70,14 @@ func NewNatsRPCServer(
 	appDieChan chan bool,
 ) (*NatsRPCServer, error) {
 	ns := &NatsRPCServer{
-		config:           config,
-		server:           server,
-		stopChan:         make(chan bool),
-		unhandledReqCh:   make(chan *protos.Request),
-		dropped:          0,
-		metricsReporters: metricsReporters,
-		appDieChan:       appDieChan,
+		config:            config,
+		server:            server,
+		stopChan:          make(chan bool),
+		unhandledReqCh:    make(chan *protos.Request),
+		dropped:           0,
+		metricsReporters:  metricsReporters,
+		appDieChan:        appDieChan,
+		connectionTimeout: nats.DefaultTimeout,
 	}
 	if err := ns.configure(); err != nil {
 		return nil, err
@@ -88,6 +91,7 @@ func (ns *NatsRPCServer) configure() error {
 	if ns.connString == "" {
 		return constants.ErrNoNatsConnectionString
 	}
+	ns.connectionTimeout = ns.config.GetDuration("pitaya.cluster.rpc.server.nats.connectiontimeout")
 	ns.maxReconnectionRetries = ns.config.GetInt("pitaya.cluster.rpc.server.nats.maxreconnectionretries")
 	ns.messagesBufferSize = ns.config.GetInt("pitaya.buffer.cluster.rpc.server.nats.messages")
 	if ns.messagesBufferSize == 0 {
@@ -203,6 +207,7 @@ func (ns *NatsRPCServer) handleMessages() {
 			maxPending = math.Max(float64(maxPending), subsChanLen)
 			logger.Log.Debugf("subs channel size: %d, max: %d, dropped: %d", subsChanLen, maxPending, dropped)
 			req := &protos.Request{}
+			// TODO: Add tracing here to report delay to start processing message in spans
 			err = proto.Unmarshal(msg.Data, req)
 			if err != nil {
 				// should answer rpc with an error
@@ -308,7 +313,14 @@ func (ns *NatsRPCServer) processKick() {
 func (ns *NatsRPCServer) Init() error {
 	// TODO should we have concurrency here? it feels like we should
 	go ns.handleMessages()
-	conn, err := setupNatsConn(ns.connString, ns.appDieChan, nats.MaxReconnects(ns.maxReconnectionRetries))
+
+	logger.Log.Debugf("connecting to nats (server) with timeout of %s", ns.connectionTimeout)
+	conn, err := setupNatsConn(
+		ns.connString,
+		ns.appDieChan,
+		nats.MaxReconnects(ns.maxReconnectionRetries),
+		nats.Timeout(ns.connectionTimeout),
+	)
 	if err != nil {
 		return err
 	}

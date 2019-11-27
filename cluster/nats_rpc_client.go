@@ -25,8 +25,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	nats "github.com/nats-io/go-nats"
+	"github.com/golang/protobuf/proto"
+	nats "github.com/nats-io/nats.go"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/topfreegames/pitaya/config"
 	"github.com/topfreegames/pitaya/conn/message"
@@ -46,6 +46,7 @@ type NatsRPCClient struct {
 	config                 *config.Config
 	conn                   *nats.Conn
 	connString             string
+	connectionTimeout      time.Duration
 	maxReconnectionRetries int
 	reqTimeout             time.Duration
 	running                bool
@@ -62,11 +63,12 @@ func NewNatsRPCClient(
 	appDieChan chan bool,
 ) (*NatsRPCClient, error) {
 	ns := &NatsRPCClient{
-		config:           config,
-		server:           server,
-		running:          false,
-		metricsReporters: metricsReporters,
-		appDieChan:       appDieChan,
+		config:            config,
+		server:            server,
+		running:           false,
+		metricsReporters:  metricsReporters,
+		appDieChan:        appDieChan,
+		connectionTimeout: nats.DefaultTimeout,
 	}
 	if err := ns.configure(); err != nil {
 		return nil, err
@@ -79,6 +81,7 @@ func (ns *NatsRPCClient) configure() error {
 	if ns.connString == "" {
 		return constants.ErrNoNatsConnectionString
 	}
+	ns.connectionTimeout = ns.config.GetDuration("pitaya.cluster.rpc.client.nats.connectiontimeout")
 	ns.maxReconnectionRetries = ns.config.GetInt("pitaya.cluster.rpc.client.nats.maxreconnectionretries")
 	ns.reqTimeout = ns.config.GetDuration("pitaya.cluster.rpc.client.nats.requesttimeout")
 	if ns.reqTimeout == 0 {
@@ -171,8 +174,7 @@ func (ns *NatsRPCClient) Call(
 		ctx = pcontext.AddToPropagateCtx(ctx, constants.RouteKey, route.String())
 		defer func() {
 			typ := "rpc"
-			errored := err != nil
-			metrics.ReportTimingFromCtx(ctx, ns.metricsReporters, typ, errored)
+			metrics.ReportTimingFromCtx(ctx, ns.metricsReporters, typ, err)
 		}()
 	}
 	m, err = ns.conn.Request(getChannel(server.Type, server.ID), marshalledData, ns.reqTimeout)
@@ -190,12 +192,12 @@ func (ns *NatsRPCClient) Call(
 		if res.Error.Code == "" {
 			res.Error.Code = errors.ErrUnknownCode
 		}
-		e := &errors.Error{
+		err = &errors.Error{
 			Code:     res.Error.Code,
 			Message:  res.Error.Msg,
 			Metadata: res.Error.Metadata,
 		}
-		return nil, e
+		return nil, err
 	}
 	return res, nil
 }
@@ -203,7 +205,13 @@ func (ns *NatsRPCClient) Call(
 // Init inits nats rpc client
 func (ns *NatsRPCClient) Init() error {
 	ns.running = true
-	conn, err := setupNatsConn(ns.connString, ns.appDieChan, nats.MaxReconnects(ns.maxReconnectionRetries))
+	logger.Log.Debugf("connecting to nats (client) with timeout of %s", ns.connectionTimeout)
+	conn, err := setupNatsConn(
+		ns.connString,
+		ns.appDieChan,
+		nats.MaxReconnects(ns.maxReconnectionRetries),
+		nats.Timeout(ns.connectionTimeout),
+	)
 	if err != nil {
 		return err
 	}

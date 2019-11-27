@@ -22,7 +22,7 @@ It provides a basic development framework for distributed multiplayer games and 
 
 * [Go](https://golang.org/) >= 1.10
 * [etcd](https://github.com/coreos/etcd) (used for service discovery)
-* [nats](https://github.com/nats-io/go-nats) (optional, used for sending and receiving rpc, grpc implementations can be used too if prefered)
+* [nats](https://github.com/nats-io/nats.go) (optional, used for sending and receiving rpc, grpc implementations can be used too if prefered)
 * [docker](https://www.docker.com) (optional: used for running etcd and nats dependencies on containers)
 
 ### Installing
@@ -104,43 +104,3 @@ If you have found a security vulnerability, please email security@tfgco.com
   + [Implement a chat room in ~100 lines with pitaya and WebSocket](./examples/demo/chat) (adapted from [nano](https://github.com/lonnng/nano)'s example)
   + [Pitaya cluster mode example](./examples/demo/cluster)
   + [Pitaya cluster mode with protobuf protocol example](./examples/demo/cluster_protobuf)
-
-## Benchmarks
-
-using grpc
-```
-===============RUNNING BENCHMARK TESTS WITH GRPC===============
---- starting testing servers
---- sleeping for 5 seconds
-goos: darwin
-goarch: amd64
-BenchmarkCreateManyClients-30                                              	    2000	    732922 ns/op
-BenchmarkFrontHandlerWithSessionAndRawReturnsRaw-30                        	    2000	    712525 ns/op
-BenchmarkFrontHandlerWithSessionAndPtrReturnsPtr-30                        	    2000	    704867 ns/op
-BenchmarkFrontHandlerWithSessionAndPtrReturnsPtrManyClientsParallel-30     	    2000	    647892 ns/op
-BenchmarkFrontHandlerWithSessionAndPtrReturnsPtrParallel-30                	    2000	    692803 ns/op
-BenchmarkFrontHandlerWithSessionOnlyReturnsPtr-30                          	    2000	    880599 ns/op
-BenchmarkFrontHandlerWithSessionOnlyReturnsPtrParallel-30                  	    2000	    630234 ns/op
-BenchmarkBackHandlerWithSessionOnlyReturnsPtr-30                           	    1000	   1123467 ns/op
-BenchmarkBackHandlerWithSessionOnlyReturnsPtrParallel-30                   	    2000	    667119 ns/op
-BenchmarkBackHandlerWithSessionOnlyReturnsPtrParallelMultipleClients-30    	    2000	    664865 ns/op
-```
-
-using nats
-```
-===============RUNNING BENCHMARK TESTS WITH NATS===============
---- starting testing servers
---- sleeping for 5 seconds
-goos: darwin
-goarch: amd64
-BenchmarkCreateManyClients-30                                              	    2000	    873214 ns/op
-BenchmarkFrontHandlerWithSessionAndRawReturnsRaw-30                        	    2000	    702125 ns/op
-BenchmarkFrontHandlerWithSessionAndPtrReturnsPtr-30                        	    2000	    794028 ns/op
-BenchmarkFrontHandlerWithSessionAndPtrReturnsPtrManyClientsParallel-30     	    2000	    769600 ns/op
-BenchmarkFrontHandlerWithSessionAndPtrReturnsPtrParallel-30                	    2000	    702894 ns/op
-BenchmarkFrontHandlerWithSessionOnlyReturnsPtr-30                          	    2000	    984978 ns/op
-BenchmarkFrontHandlerWithSessionOnlyReturnsPtrParallel-30                  	    2000	    699000 ns/op
-BenchmarkBackHandlerWithSessionOnlyReturnsPtr-30                           	    1000	   1945727 ns/op
-BenchmarkBackHandlerWithSessionOnlyReturnsPtrParallel-30                   	    2000	    784496 ns/op
-BenchmarkBackHandlerWithSessionOnlyReturnsPtrParallelMultipleClients-30    	    2000	    846923 ns/op
-```

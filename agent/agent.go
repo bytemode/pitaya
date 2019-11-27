@@ -23,7 +23,7 @@ package agent
 import (
 	"context"
 	gojson "encoding/json"
-	"errors"
+	e "errors"
 	"fmt"
 	"net"
 	"strings"
@@ -31,11 +31,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/topfreegames/pitaya/conn/codec"
 	"github.com/topfreegames/pitaya/conn/message"
 	"github.com/topfreegames/pitaya/conn/packet"
 	"github.com/topfreegames/pitaya/constants"
+	"github.com/topfreegames/pitaya/errors"
 	"github.com/topfreegames/pitaya/logger"
 	"github.com/topfreegames/pitaya/metrics"
 	"github.com/topfreegames/pitaya/protos"
@@ -44,6 +44,8 @@ import (
 	"github.com/topfreegames/pitaya/tracing"
 	"github.com/topfreegames/pitaya/util"
 	"github.com/topfreegames/pitaya/util/compression"
+
+	opentracing "github.com/opentracing/opentracing-go"
 )
 
 var (
@@ -65,16 +67,17 @@ type (
 		chSend             chan pendingMessage // push message queue
 		chStopHeartbeat    chan struct{}       // stop heartbeats
 		chStopWrite        chan struct{}       // stop writing messages
+		closeMutex         sync.Mutex
 		conn               net.Conn            // low-level conn fd
 		decoder            codec.PacketDecoder // binary decoder
 		encoder            codec.PacketEncoder // binary encoder
 		heartbeatTimeout   time.Duration
-		lastAt             int64                // last heartbeat unix time stamp
-		messagesBufferSize int                  // size of the pending messages buffer
+		lastAt             int64 // last heartbeat unix time stamp
+		messageEncoder     message.Encoder
+		messagesBufferSize int // size of the pending messages buffer
+		metricsReporters   []metrics.Reporter
 		serializer         serialize.Serializer // message serializer
 		state              int32                // current agent state
-		messageEncoder     message.Encoder
-		metricsReporters   []metrics.Reporter
 	}
 
 	pendingMessage struct {
@@ -99,7 +102,7 @@ func NewAgent(
 	messageEncoder message.Encoder,
 	metricsReporters []metrics.Reporter,
 ) *Agent {
-	// initialize heartbeat and handshake data on first player connection
+	// initialize heartbeat and handshake data on first user connection
 	once.Do(func() {
 		hbdEncode(heartbeatTime, packetEncoder, messageEncoder.IsCompressionEnabled(), serializer.GetName())
 	})
@@ -108,9 +111,9 @@ func NewAgent(
 		appDieChan:         dieChan,
 		chDie:              make(chan struct{}),
 		chSend:             make(chan pendingMessage, messagesBufferSize),
-		messagesBufferSize: messagesBufferSize,
 		chStopHeartbeat:    make(chan struct{}),
 		chStopWrite:        make(chan struct{}),
+		messagesBufferSize: messagesBufferSize,
 		conn:               conn,
 		decoder:            packetDecoder,
 		encoder:            packetEncoder,
@@ -132,7 +135,7 @@ func NewAgent(
 func (a *Agent) send(m pendingMessage) (err error) {
 	defer func() {
 		if e := recover(); e != nil {
-			err = constants.ErrBrokenPipe
+			err = errors.NewError(constants.ErrBrokenPipe, errors.ErrClientClosedRequest)
 		}
 	}()
 	a.reportChannelSize()
@@ -143,7 +146,7 @@ func (a *Agent) send(m pendingMessage) (err error) {
 // Push implementation for session.NetworkEntity interface
 func (a *Agent) Push(route string, v interface{}) error {
 	if a.GetStatus() == constants.StatusClosed {
-		return constants.ErrBrokenPipe
+		return errors.NewError(constants.ErrBrokenPipe, errors.ErrClientClosedRequest)
 	}
 
 	switch d := v.(type) {
@@ -165,16 +168,16 @@ func (a *Agent) ResponseMID(ctx context.Context, mid uint, v interface{}, isErro
 		err = isError[0]
 	}
 	if a.GetStatus() == constants.StatusClosed {
-		err := constants.ErrBrokenPipe
+		err := errors.NewError(constants.ErrBrokenPipe, errors.ErrClientClosedRequest)
 		tracing.FinishSpan(ctx, err)
-		metrics.ReportTimingFromCtx(ctx, a.metricsReporters, handlerType, true)
+		metrics.ReportTimingFromCtx(ctx, a.metricsReporters, handlerType, err)
 		return err
 	}
 
 	if mid <= 0 {
 		err := constants.ErrSessionOnNotify
 		tracing.FinishSpan(ctx, err)
-		metrics.ReportTimingFromCtx(ctx, a.metricsReporters, handlerType, true)
+		metrics.ReportTimingFromCtx(ctx, a.metricsReporters, handlerType, err)
 		return err
 	}
 
@@ -193,12 +196,14 @@ func (a *Agent) ResponseMID(ctx context.Context, mid uint, v interface{}, isErro
 // Close closes the agent, cleans inner state and closes low-level connection.
 // Any blocked Read or Write operations will be unblocked and return errors.
 func (a *Agent) Close() error {
+	a.closeMutex.Lock()
+	defer a.closeMutex.Unlock()
 	if a.GetStatus() == constants.StatusClosed {
 		return constants.ErrCloseClosedSession
 	}
 	a.SetStatus(constants.StatusClosed)
 
-	logger.Log.Debugf("Session closed, ID=%d, UID=%d, IP=%s",
+	logger.Log.Debugf("Session closed, ID=%d, UID=%s, IP=%s",
 		a.Session.ID(), a.Session.UID(), a.conn.RemoteAddr())
 
 	// prevent closing closed channel
@@ -225,7 +230,7 @@ func (a *Agent) RemoteAddr() net.Addr {
 
 // String, implementation for Stringer interface
 func (a *Agent) String() string {
-	return fmt.Sprintf("Remote=%s, LastTime=%d", a.conn.RemoteAddr().String(), a.lastAt)
+	return fmt.Sprintf("Remote=%s, LastTime=%d", a.conn.RemoteAddr().String(), atomic.LoadInt64(&a.lastAt))
 }
 
 // GetStatus gets the status
@@ -246,7 +251,7 @@ func (a *Agent) Kick(ctx context.Context) error {
 
 // SetLastAt sets the last at to now
 func (a *Agent) SetLastAt() {
-	a.lastAt = time.Now().Unix()
+	atomic.StoreInt64(&a.lastAt, time.Now().Unix())
 }
 
 // SetStatus sets the agent status
@@ -298,8 +303,8 @@ func (a *Agent) heartbeat() {
 		select {
 		case <-ticker.C:
 			deadline := time.Now().Add(-2 * a.heartbeatTimeout).Unix()
-			if a.lastAt < deadline {
-				logger.Log.Debugf("Session heartbeat timeout, LastTime=%d, Deadline=%d", a.lastAt, deadline)
+			if atomic.LoadInt64(&a.lastAt) < deadline {
+				logger.Log.Debugf("Session heartbeat timeout, LastTime=%d, Deadline=%d", atomic.LoadInt64(&a.lastAt), deadline)
 				return
 			}
 			if _, err := a.conn.Write(hbd); err != nil {
@@ -347,12 +352,12 @@ func (a *Agent) write() {
 		case data := <-a.chSend:
 			payload, err := util.SerializeOrRaw(a.serializer, data.payload)
 			if err != nil {
-				logger.Log.Error(err.Error())
+				logger.Log.Errorf("Failed to serialize response: %s", err.Error())
 				payload, err = util.GetErrorPayload(a.serializer, err)
 				if err != nil {
 					tracing.FinishSpan(data.ctx, err)
 					if data.typ == message.Response {
-						metrics.ReportTimingFromCtx(data.ctx, a.metricsReporters, handlerType, true)
+						metrics.ReportTimingFromCtx(data.ctx, a.metricsReporters, handlerType, err)
 					}
 					logger.Log.Error("cannot serialize message and respond to the client ", err.Error())
 					break
@@ -371,9 +376,9 @@ func (a *Agent) write() {
 			if err != nil {
 				tracing.FinishSpan(data.ctx, err)
 				if data.typ == message.Response {
-					metrics.ReportTimingFromCtx(data.ctx, a.metricsReporters, handlerType, true)
+					metrics.ReportTimingFromCtx(data.ctx, a.metricsReporters, handlerType, err)
 				}
-				logger.Log.Error(err.Error())
+				logger.Log.Errorf("Failed to encode message: %s", err.Error())
 				break
 			}
 
@@ -382,24 +387,28 @@ func (a *Agent) write() {
 			if err != nil {
 				tracing.FinishSpan(data.ctx, err)
 				if data.typ == message.Response {
-					metrics.ReportTimingFromCtx(data.ctx, a.metricsReporters, handlerType, true)
+					metrics.ReportTimingFromCtx(data.ctx, a.metricsReporters, handlerType, err)
 				}
-				logger.Log.Error(err)
+				logger.Log.Errorf("Failed to encode packet: %s", err.Error())
 				break
 			}
 			// close agent if low-level Conn broken
 			if _, err := a.conn.Write(p); err != nil {
 				tracing.FinishSpan(data.ctx, err)
 				if data.typ == message.Response {
-					metrics.ReportTimingFromCtx(data.ctx, a.metricsReporters, handlerType, true)
+					metrics.ReportTimingFromCtx(data.ctx, a.metricsReporters, handlerType, err)
 				}
-				logger.Log.Error(err.Error())
+				logger.Log.Errorf("Failed to write response: %s", err.Error())
 				return
 			}
 			var e error
 			tracing.FinishSpan(data.ctx, e)
 			if data.typ == message.Response {
-				metrics.ReportTimingFromCtx(data.ctx, a.metricsReporters, handlerType, m.Err)
+				var rErr error
+				if m.Err {
+					rErr = util.GetErrorFromPayload(a.serializer, payload)
+				}
+				metrics.ReportTimingFromCtx(data.ctx, a.metricsReporters, handlerType, rErr)
 			}
 		case <-a.chStopWrite:
 			return
@@ -409,7 +418,7 @@ func (a *Agent) write() {
 
 // SendRequest sends a request to a server
 func (a *Agent) SendRequest(ctx context.Context, serverID, route string, v interface{}) (*protos.Response, error) {
-	return nil, errors.New("not implemented")
+	return nil, e.New("not implemented")
 }
 
 // AnswerWithError answers with an error
@@ -422,12 +431,12 @@ func (a *Agent) AnswerWithError(ctx context.Context, mid uint, err error) {
 	}
 	p, e := util.GetErrorPayload(a.serializer, err)
 	if e != nil {
-		logger.Log.Error("error answering the player with an error: ", e.Error())
+		logger.Log.Errorf("error answering the user with an error: %s", e.Error())
 		return
 	}
 	e = a.Session.ResponseMID(ctx, mid, p, true)
 	if e != nil {
-		logger.Log.Error("error answering the player with an error: ", e.Error())
+		logger.Log.Errorf("error answering the user with an error: %s", e.Error())
 	}
 }
 
